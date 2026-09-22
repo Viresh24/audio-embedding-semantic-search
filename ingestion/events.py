@@ -3,9 +3,9 @@ Zero-shot sound-event scoring with CLAP, shared by ingestion and search.
 
 Each label is embedded as the average of many (alias x prompt template) text
 embeddings, which is far less sensitive to phrasing than a single
-"sound of {x}" prompt. Every clip is scored against event labels (which can
-become tags) and contrast labels (speech, room noise, ...) that are never
-tags but give speech-heavy clips somewhere to put their probability mass.
+"sound of {x}" prompt. Every clip is scored against event labels and
+contrast labels (speech, room noise, ...), which give speech-heavy clips
+somewhere to put their probability mass.
 
 Per clip we keep three views of the same cosine similarities:
   - scores: raw cosine per label
@@ -14,8 +14,8 @@ Per clip we keep three views of the same cosine similarities:
   - z:      (cosine - mean) / std per label, using stats from a calibration
             set, which removes each label's built-in bias
 
-Tagging uses z when calibration stats exist, otherwise the top event label
-if its probability is high enough.
+These scores are stored alongside each clip; they don't decide its labels,
+which come straight from the source dataset (see ingestion/ingest.py).
 """
 
 import hashlib
@@ -60,8 +60,6 @@ PROMPT_TEMPLATES = [
     "a sound recording of {}",
 ]
 
-Z_THRESHOLD = 2.0
-PROB_THRESHOLD = 0.3
 DEFAULT_CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_calibration.json")
 
 _SCORING_METHOD = "alias-template-mean/softmax-logit-scale/z-score"
@@ -118,10 +116,8 @@ def score_clip(
     label_matrix: np.ndarray,
     logit_scale: float,
     calib: dict | None = None,
-    z_threshold: float = Z_THRESHOLD,
-    prob_threshold: float = PROB_THRESHOLD,
 ) -> dict:
-    """Returns {"scores", "probs", "z", "tags"}; "z" is None without calibration stats."""
+    """Returns {"scores", "probs", "z"}; "z" is None without calibration stats."""
     cos = _cosines(label_matrix, np.asarray(audio_vec))
     logits = logit_scale * cos
     probs = np.exp(logits - logits.max())
@@ -134,12 +130,8 @@ def score_clip(
     if calib is not None:
         stats = calib["labels"]
         z = {n: (scores[n] - stats[n]["mean"]) / max(stats[n]["std"], 1e-6) for n in names if n in stats}
-        tags = [n for n in EVENT_LABELS if z.get(n, float("-inf")) >= z_threshold]
-    else:
-        top_event = max(EVENT_LABELS, key=prob_map.get)
-        tags = [top_event] if prob_map[top_event] >= prob_threshold else []
 
-    return {"scores": scores, "probs": prob_map, "z": z, "tags": tags}
+    return {"scores": scores, "probs": prob_map, "z": z}
 
 
 def event_payload(result: dict) -> dict:
@@ -148,7 +140,6 @@ def event_payload(result: dict) -> dict:
         return {k: round(v, 4) for k, v in d.items()}
 
     return {
-        "tags": result["tags"],
         "event_scores": rnd(result["scores"]),
         "event_probs": rnd(result["probs"]),
         "event_z": rnd(result["z"]) if result["z"] is not None else None,

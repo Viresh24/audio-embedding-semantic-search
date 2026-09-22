@@ -1,7 +1,7 @@
 """
 Thin wrappers around the two models the pipeline needs:
 
-- CLAPEmbedder: shared audio/text embedding space (search, sound-event tagging)
+- CLAPEmbedder: shared audio/text embedding space (search, sound-event scoring)
 - Transcriber:  speech-to-text (Whisper) for the transcript column + lexical search
 """
 
