@@ -6,6 +6,10 @@ Covers the four requirements:
   - text_search()         : hybrid lexical (BM25 over transcripts) + semantic (CLAP)
   - audio_to_audio_search(): "search by example" -- find clips like this clip
   - event_search()        : zero-shot "dog barking" / "coughing" style queries
+
+Run from the project root (so the embeddings and ingestion packages are importable):
+  python -m search.search text_search "question about pricing"
+  python -m search.search event_search "dog barking" --top-k 5
 """
 
 from dataclasses import dataclass
@@ -13,8 +17,9 @@ from dataclasses import dataclass
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
-from embeddings import CLAPEmbedder
-from ingest import COLLECTION
+from embeddings.embeddings import CLAPEmbedder
+from ingestion.events import embed_event_query
+from ingestion.ingest import COLLECTION
 
 
 @dataclass
@@ -66,7 +71,6 @@ class AudioSearchEngine:
         """
         # Semantic leg: embed the query, search against the "text" vector space
         # (transcript embeddings), which is more reliable for spoken-content
-        # intent queries like "question about pricing" than the audio vectors.
         query_vec = self.clap.embed_text([query])[0]
         semantic_hits = self.client.search(
             collection_name=COLLECTION,
@@ -92,13 +96,8 @@ class AudioSearchEngine:
         }
         top_ids = sorted(blended, key=blended.get, reverse=True)[:top_k]
 
-        points, _ = self.client.scroll(
-            collection_name=COLLECTION,
-            scroll_filter=None,
-            limit=len(top_ids),
-            with_payload=True,
-        )
-        by_id = {p.id: p for p in points if p.id in top_ids}
+        points = self.client.retrieve(collection_name=COLLECTION, ids=top_ids, with_payload=True)
+        by_id = {p.id: p for p in points}
         return [_to_result(by_id[i], blended[i]) for i in top_ids if i in by_id]
 
     def audio_to_audio_search(self, query_audio_path: str, top_k: int = 10) -> list[SearchResult]:
@@ -114,10 +113,11 @@ class AudioSearchEngine:
     def event_search(self, event_description: str, top_k: int = 10, threshold: float = 0.15) -> list[SearchResult]:
         """
         Zero-shot event detection, e.g. event_search("dog barking").
-        Uses the same "sound of {event}" prompt template as ingest-time tagging,
-        so results are consistent with the precomputed `tags` field.
+        Builds the query vector the same way as ingest-time label vectors
+        (aliases x prompt templates, averaged), so known labels match the
+        precomputed `tags` field and free-text queries get the same ensembling.
         """
-        query_vec = self.clap.embed_text([f"sound of {event_description}"])[0]
+        query_vec = embed_event_query(self.clap, event_description)
         hits = self.client.search(
             collection_name=COLLECTION,
             query_vector=("audio", query_vec.tolist()),
@@ -126,14 +126,36 @@ class AudioSearchEngine:
         )
         return [_to_result(h, h.score) for h in hits]
 
+    def close(self):
+        self.client.close()
+
 
 if __name__ == "__main__":
-    engine = AudioSearchEngine()
+    import argparse
 
-    print("\n-- text search: 'question about pricing' --")
-    for r in engine.text_search("question about pricing"):
-        print(f"  [{r.score:.3f}] {r.transcript[:60]!r}  tags={r.tags}")
+    parser = argparse.ArgumentParser(description="Search the audio clip index.")
+    parser.add_argument("type", choices=["text_search", "event_search"], help="Which search to run.")
+    parser.add_argument(
+        "query",
+        help="For text_search: what the speech is about. For event_search: a sound event, e.g. 'dog barking'.",
+    )
+    parser.add_argument("--top-k", type=int, default=10, help="Maximum number of results.")
+    parser.add_argument("--qdrant-url", default="http://localhost:6333")
+    args = parser.parse_args()
 
-    print("\n-- event search: 'dog barking' --")
-    for r in engine.event_search("dog barking"):
-        print(f"  [{r.score:.3f}] {r.file_path}  tags={r.tags}")
+    engine = AudioSearchEngine(qdrant_url=args.qdrant_url)
+    try:
+        print(f"\n-- {args.type}: {args.query!r} --")
+        if args.type == "text_search":
+            results = engine.text_search(args.query, top_k=args.top_k)
+            for r in results:
+                print(f"  [{r.score:.3f}] {r.transcript[:60]!r}  tags={r.tags}")
+        else:
+            results = engine.event_search(args.query, top_k=args.top_k)
+            for r in results:
+                print(f"  [{r.score:.3f}] {r.file_path}  tags={r.tags}")
+
+        if not results:
+            print("  (no results)")
+    finally:
+        engine.close()

@@ -28,7 +28,7 @@ class CLAPEmbedder:
         import laion_clap  # imported lazily so this module can be reused without the dep installed
 
         self.model = laion_clap.CLAP_Module(enable_fusion=True, device=device)
-        self.model.load_ckpt()  # downloads/loads the pretrained checkpoint
+        self.model.load_ckpt(verbose=False)  # downloads/loads the pretrained checkpoint
 
     def embed_audio(self, file_paths: list[str]) -> np.ndarray:
         """Batch-embed one or more audio files. Returns (N, 512) L2-normalized vectors."""
@@ -39,6 +39,11 @@ class CLAPEmbedder:
         """Batch-embed one or more text strings. Returns (N, 512) L2-normalized vectors."""
         vecs = self.model.get_text_embedding(texts, use_tensor=False)
         return self._l2_normalize(vecs)
+
+    @property
+    def logit_scale(self) -> float:
+        """CLAP's learned temperature for audio-text logits (cosine * logit_scale)."""
+        return self.model.model.logit_scale_a.detach().exp().item()
 
     @staticmethod
     def _l2_normalize(vecs: np.ndarray) -> np.ndarray:
